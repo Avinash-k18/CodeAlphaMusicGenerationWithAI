@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Melody Lab – AI music generator</title>
+<style>
+:root{--bg:#eef1f4;--panel:#fff;--ink:#14213d;--mute:#5b6577;--line:#d5dbe3;--accent:#0e7c86;--accent-ink:#fff;--roll:#10192e;--err:#b3261e}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1320;--panel:#161e30;--ink:#e8ecf3;--mute:#9aa5b8;--line:#2a3550;--accent:#4fc3c9;--accent-ink:#06222a;--roll:#080d19;--err:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:980px;margin:0 auto;padding:32px 20px 48px}
+h1{font:600 clamp(2rem,5vw,3rem)/1.1 Georgia,"Iowan Old Style",serif;margin:0 0 8px;letter-spacing:-.01em}
+.lead{color:var(--mute);margin:0 0 24px;max-width:60ch}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px}
+.roll{background:var(--roll);border-radius:10px;padding:0;overflow:hidden;position:relative;min-height:240px;margin-bottom:16px}
+canvas{display:block;width:100%;height:240px}
+.empty{position:absolute;inset:0;display:grid;place-items:center;color:#9aa5b8;text-align:center;padding:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:18px 24px;margin-bottom:18px}
+label{display:block;font-weight:600;font-size:.9rem;margin-bottom:6px}
+label output{float:right;color:var(--mute);font-weight:400}
+input[type=range]{width:100%;accent-color:var(--accent)}
+input[type=number]{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);font:inherit}
+small{color:var(--mute);display:block;margin-top:4px;font-size:.8rem}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+button,.btn{font:inherit;font-weight:600;padding:10px 18px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer;text-decoration:none}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+button:disabled,.btn.off{opacity:.45;cursor:not-allowed;pointer-events:none}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.msg{margin-top:14px;padding:10px 14px;border-radius:6px;border:1px solid var(--err);color:var(--err);display:none}
+.msg.info{border-color:var(--line);color:var(--mute)}
+.badge{display:inline-block;font-size:.8rem;padding:2px 10px;border-radius:99px;border:1px solid var(--line);color:var(--mute);margin-left:8px;vertical-align:middle}
+.badge.ok{border-color:var(--accent);color:var(--accent)}
+.hist{margin-top:24px}.hist h2{font:600 1.2rem Georgia,serif;margin:0 0 10px}
+.hist button{margin:0 8px 8px 0;padding:6px 12px;font-weight:500}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<main>
+  <h1>Melody Lab <span id="badge" class="badge">checking…</span></h1>
+  <p class="lead">An LSTM network trained on MIDI files composes new music note by note. Set the options, generate, listen, and download the MIDI.</p>
+
+  <div class="roll"><canvas id="cv" aria-label="Piano roll of the generated melody"></canvas>
+    <div id="empty" class="empty">Your melody will appear here as a piano roll.</div></div>
+
+  <div class="panel">
+    <div class="grid">
+      <div><label for="length">Length <output id="lenO">64</output></label>
+        <input id="length" type="range" min="8" max="400" value="64"><small>Number of notes/chords</small></div>
+      <div><label for="temp">Creativity <output id="tempO">1.0</output></label>
+        <input id="temp" type="range" min="0.2" max="2" step="0.1" value="1"><small>Low = safe and repetitive, high = adventurous</small></div>
+      <div><label for="bpm">Tempo <output id="bpmO">100</output></label>
+        <input id="bpm" type="range" min="40" max="220" value="100"><small>Beats per minute</small></div>
+      <div><label for="seed">Seed (optional)</label>
+        <input id="seed" type="number" min="0" max="2147483647" placeholder="Random"><small>Same seed + settings = same melody</small></div>
+    </div>
+    <div class="row">
+      <button id="gen" class="primary">Generate melody</button>
+      <button id="play" disabled>Play</button>
+      <a id="dl" class="btn off" href="#" download>Download MIDI</a>
+    </div>
+    <div id="msg" class="msg" role="alert"></div>
+  </div>
+
+  <div class="hist" id="hist" hidden><h2>This session</h2><div id="histList"></div></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const cv=$('cv'),ctx=cv.getContext('2d');
+let current=null, audio=null, raf=0, history=[], ready=false;
+
+for(const [i,o] of [['length','lenO'],['temp','tempO'],['bpm','bpmO']])
+  $(i).addEventListener('input',()=>$(o).textContent=$(i).value);
+
+function show(text,info){const m=$('msg');m.textContent=text;m.className='msg'+(info?' info':'');m.style.display=text?'block':'none'}
+
+async function status(){
+  try{
+    const r=await (await fetch('/api/status')).json();
+    ready=r.ready;
+    $('badge').textContent=ready?'model ready':'model not trained';
+    $('badge').className='badge'+(ready?' ok':'');
+    if(!ready) show((r.message||'Model not loaded.')+' Run "python train.py" in the project folder, then restart the server.');
+  }catch{ $('badge').textContent='server offline'; show('Cannot reach the server. Start it with "python app.py".'); }
+  $('gen').disabled=!ready;
+}
+
+function draw(notes,bpm,playhead){
+  const dpr=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  cv.width=w*dpr;cv.height=h*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+  if(!notes)return;
+  const all=notes.flatMap(n=>n.pitches),lo=Math.min(...all)-1,hi=Math.max(...all)+1;
+  const total=notes[notes.length-1].start+notes[notes.length-1].dur,ph=h/(hi-lo+1);
+  ctx.strokeStyle='rgba(255,255,255,.06)';
+  for(let p=lo;p<=hi;p++){ctx.beginPath();ctx.moveTo(0,h-(p-lo+1)*ph);ctx.lineTo(w,h-(p-lo+1)*ph);ctx.stroke()}
+  for(const n of notes)for(const p of n.pitches){
+    ctx.fillStyle=`hsl(${170+(p%12)*14},70%,62%)`;
+    ctx.fillRect(n.start/total*w+1,h-(p-lo+1)*ph+1,Math.max(2,n.dur/total*w-2),Math.max(2,ph-2));
+  }
+  if(playhead!=null){ctx.fillStyle='#fff';ctx.fillRect(playhead/total*w,0,2,h)}
+}
+
+function stop(){
+  cancelAnimationFrame(raf);
+  if(audio){audio.close().catch(()=>{});audio=null}
+  $('play').textContent='Play';
+  if(current)draw(current.notes,current.bpm);
+}
+
+function play(){
+  if(audio){stop();return}
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC){show('This browser cannot play audio. Download the MIDI instead.');return}
+  audio=new AC();const spb=60/current.bpm,t0=audio.currentTime+.1;
+  for(const n of current.notes)for(const p of n.pitches){
+    const o=audio.createOscillator(),g=audio.createGain(),s=t0+n.start*spb,e=s+Math.max(.08,n.dur*spb);
+    o.type='triangle';o.frequency.value=440*Math.pow(2,(p-69)/12);
+    g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(.18/Math.sqrt(n.pitches.length),s+.02);
+    g.gain.exponentialRampToValueAtTime(.001,e);
+    o.connect(g).connect(audio.destination);o.start(s);o.stop(e+.05);
+  }
+  const end=current.duration_beats*spb;$('play').textContent='Stop';
+  (function tick(){
+    const t=audio?audio.currentTime-t0:end;
+    if(t>=end){stop();return}
+    draw(current.notes,current.bpm,Math.max(0,t/spb));raf=requestAnimationFrame(tick);
+  })();
+}
+
+function load(item){
+  stop();current=item;$('empty').hidden=true;draw(item.notes,item.bpm);
+  $('play').disabled=false;$('dl').href='/api/download/'+item.id;$('dl').classList.remove('off');
+}
+
+async function generate(){
+  stop();show('');$('gen').disabled=true;$('gen').textContent='Composing…';
+  const seed=$('seed').value.trim();
+  try{
+    const res=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({length:+$('length').value,temperature:+$('temp').value,bpm:+$('bpm').value,seed:seed===''?null:+seed})});
+    const data=await res.json();
+    if(!res.ok)throw new Error(data.error||'Generation failed.');
+    load(data);history.unshift(data);renderHist();
+  }catch(e){show(e.message||'Network error. Check that the server is running.')}
+  finally{$('gen').disabled=!ready;$('gen').textContent='Generate melody'}
+}
+
+function renderHist(){
+  $('hist').hidden=!history.length;$('histList').replaceChildren(...history.slice(0,8).map((h,i)=>{
+    const b=document.createElement('button');b.textContent=`Melody ${history.length-i} · ${h.notes.length} notes`;
+    b.onclick=()=>load(h);return b}));
+}
+
+$('gen').onclick=generate;$('play').onclick=play;
+addEventListener('resize',()=>current&&!audio&&draw(current.notes,current.bpm));
+status();
+</script>
+</body>
+</html>
